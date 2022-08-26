@@ -1,0 +1,281 @@
+AWSTemplateFormatVersion: '2010-09-09'
+
+Parameters:
+  # General
+  Project:
+    Description: Input project name.
+    Type: String
+    Default: 'fargate-batch-job-template'
+  # EventBridge
+  ScheduleExpression:
+    Description: Input batch schedule expression UTC.
+    Type: String
+    Default: 'cron(0 9 * * ? *)'
+  # VPC
+  VpcCidrBlock:
+    Description: Input a VPC IPv4 CidrBlock. ex) 192.168.2.0/24
+    Default: '192.168.3.0/24'
+    Type: String
+  # Public Subnet
+  AZ:
+    Description: Input a AZ where Public Subnet will be created.
+    Type: AWS::EC2::AvailabilityZone::Name
+    Default: ap-northeast-1a
+  PublicSubnetCidrBlock:
+    Description: Input a Public Subnet IPv4 CidrBlock.  ex) 192.168.2.0/25
+    Default: '192.168.3.0/25'
+    Type: String
+  # ECS
+  AllowEcsPolicy:
+    Description: Input policy allowed to ECS task.
+    Type: List<String>
+    Default: 's3:List*,s3:Get*,s3:Put*'
+  TaskCpu:
+    Description: Input CPU value for ECS Task.
+    Type: Number
+    AllowedValues : 
+      - 256
+      - 512
+      - 1024
+      - 2048
+      - 4096
+    Default: 256
+  TaskMemory:
+    Description: Input memory value for ECS task.
+    Type: Number
+    Default: 1024
+  TaskCount:
+    Description: Input Number of ECS tasks to launch at once.
+    Type: Number
+    Default: 1
+
+Resources:
+  # VPC
+  VPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: !Ref VpcCidrBlock
+      EnableDnsHostnames: true
+      EnableDnsSupport: true
+      InstanceTenancy: default
+      Tags:
+        -
+          Key: Project
+          Value: !Ref Project
+  # PublicSubnet
+  PublicSubnet:
+    Type: AWS::EC2::Subnet
+    Properties:
+      AvailabilityZone: !Ref AZ
+      CidrBlock: !Ref PublicSubnetCidrBlock
+      MapPublicIpOnLaunch: true
+      VpcId: !Ref VPC
+      Tags:
+        -
+          Key: Project
+          Value: !Ref Project
+  # InternetGW
+  InternetGW:
+    Type: AWS::EC2::InternetGateway
+    Properties:
+      Tags:
+        -
+          Key: Project
+          Value: !Ref Project
+  VPCGatewayAttachment:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      InternetGatewayId: !Ref InternetGW
+      VpcId: !Ref VPC
+  # RouteTable for Public Subnet
+  RouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+        -
+          Key: Project
+          Value: !Ref Project
+  PublicRoute:
+    Type: AWS::EC2::Route
+    Properties:
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGW
+      RouteTableId: !Ref RouteTable
+  SubnetRouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      RouteTableId: !Ref RouteTable
+      SubnetId: !Ref PublicSubnet
+  SecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: !Ref Project
+      GroupDescription: Security group for the service
+      VpcId: !Ref VPC
+      Tags:
+        -
+          Key: Project
+          Value: !Ref Project
+  SecurityGroupIngress:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !Ref SecurityGroup
+      IpProtocol: -1
+      SourceSecurityGroupId: !Ref SecurityGroup
+      Tags:
+        -
+          Key: Project
+          Value: !Ref Project
+  Cluster:
+    Type: AWS::ECS::Cluster
+    Properties:
+      ClusterName: !Ref Project
+
+  Repository:
+    Type: AWS::ECR::Repository
+    Properties:
+      RepositoryName: !Ref Project
+
+  LogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /ecs/${Project}
+
+  EcsTaskExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - ecs-tasks.amazonaws.com
+                - events.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy
+      RoleName: !Sub ${Project}-task-execution-role
+
+  EcsTaskExecutionRolePolicy:
+    Type: AWS::IAM::Policy
+    Properties:
+      PolicyName: !Sub ${Project}-task-execution-role-policy
+      PolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Action: 
+              - ecs:RunTask
+            Resource: 
+              - !Sub arn:aws:ecs:*:${AWS::AccountId}:task-definition/${Repository}:*
+              - !Sub arn:aws:ecs:*:${AWS::AccountId}:task-definition/${Repository}
+            Condition:
+              ArnLike:
+                'ecs:cluster': !Sub arn:aws:ecs:${AWS::Region}:${AWS::AccountId}:cluster/${Repository}
+          - Effect: Allow
+            Action: 
+              - iam:PassRole
+            Resource: '*'
+            Condition:
+              StringLike: 
+                iam:PassedToService: 'ecs-tasks.amazonaws.com'
+          - Effect: Allow
+            Action:
+              - ecr:GetLifecyclePolicyPreview
+              - ecr:GetDownloadUrlForLayer
+              - ecr:BatchGetImage
+              - ecr:DescribeImages
+              - ecr:ListTagsForResource
+              - ecr:BatchCheckLayerAvailability
+              - ecr:GetLifecyclePolicy
+              - ecr:GetRepositoryPolicy
+            Resource: !Sub "arn:aws:ecr:${AWS::Region}:${AWS::AccountId}:repository/*"
+          - Effect: Allow
+            Action:
+              - ecr:GetAuthorizationToken
+              - ssm:GetParameters
+              - secretsmanager:GetSecretValue
+            Resource:
+              - !Sub "arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/*"
+      Roles:
+        - Ref: EcsTaskExecutionRole
+
+  EcsTaskRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - ecs-tasks.amazonaws.com
+                - events.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AmazonEC2ContainerServiceEventsRole
+      RoleName: !Sub ${Project}-task-role
+
+  EcsTaskRolePolicy:
+    Type: AWS::IAM::Policy
+    Properties:
+      PolicyName: !Sub ${Project}-task-role-policy
+      PolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Action: !Ref AllowEcsPolicy
+            Resource: '*'
+      Roles:
+        - Ref: EcsTaskRole
+
+  TaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: !Ref Project
+      RequiresCompatibilities:
+        - FARGATE
+      Cpu: !Ref TaskCpu
+      Memory: !Ref TaskMemory
+      NetworkMode: awsvpc
+      ExecutionRoleArn: !GetAtt EcsTaskExecutionRole.Arn
+      TaskRoleArn: !GetAtt EcsTaskRole.Arn
+      ContainerDefinitions:
+        - Name: app
+          Image: !Sub ${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com/${Repository}
+          Environment:
+            - Name: TZ
+              Value: Asia/Tokyo
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-region: !Ref 'AWS::Region'
+              awslogs-group: !Ref LogGroup
+              awslogs-stream-prefix: app
+          Essential: true
+
+  EventRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Ref Project
+      State: ENABLED
+      ScheduleExpression: !Ref ScheduleExpression
+      Targets:
+        - Id: !Ref Project
+          Arn: !GetAtt Cluster.Arn
+          RoleArn: !GetAtt EcsTaskExecutionRole.Arn
+          EcsParameters:
+            TaskDefinitionArn: !Ref TaskDefinition
+            TaskCount: !Ref TaskCount
+            LaunchType: FARGATE
+            NetworkConfiguration:
+              AwsVpcConfiguration:
+                AssignPublicIp: ENABLED
+                SecurityGroups:
+                  - !Ref SecurityGroup
+                Subnets: 
+                  - !Ref PublicSubnet
